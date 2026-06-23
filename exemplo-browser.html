@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chat WebSocket - Exemplo</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+            max-width: 600px;
+            width: 100%;
+            height: 600px;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 12px 12px 0 0;
+        }
+        
+        .header h1 {
+            font-size: 24px;
+            margin-bottom: 5px;
+        }
+        
+        .status {
+            font-size: 12px;
+            opacity: 0.9;
+        }
+        
+        .status.connected { color: #4ade80; }
+        .status.disconnected { color: #f87171; }
+        
+        .auth-screen, .chat-screen {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            padding: 20px;
+        }
+        
+        .auth-screen {
+            justify-content: center;
+            align-items: center;
+            text-align: center;
+        }
+        
+        .auth-screen h2 {
+            margin-bottom: 10px;
+            color: #333;
+        }
+        
+        .auth-screen p {
+            color: #666;
+            margin-bottom: 20px;
+        }
+        
+        .user-id {
+            background: #f3f4f6;
+            padding: 10px;
+            border-radius: 6px;
+            font-size: 11px;
+            color: #666;
+            margin-bottom: 20px;
+            word-break: break-all;
+        }
+        
+        input[type="text"] {
+            padding: 12px 16px;
+            border: 2px solid #e5e7eb;
+            border-radius: 8px;
+            font-size: 16px;
+            width: 100%;
+            max-width: 300px;
+            transition: border-color 0.2s;
+        }
+        
+        input[type="text"]:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        button {
+            padding: 12px 24px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s;
+            margin-top: 10px;
+        }
+        
+        button:hover {
+            transform: translateY(-2px);
+        }
+        
+        button:active {
+            transform: translateY(0);
+        }
+        
+        .error {
+            color: #ef4444;
+            margin-top: 10px;
+            font-size: 14px;
+        }
+        
+        .messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+            background: #f9fafb;
+            margin: -20px -20px 20px -20px;
+        }
+        
+        .message {
+            margin-bottom: 12px;
+            animation: slideIn 0.3s ease;
+        }
+        
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        
+        .message.system {
+            text-align: center;
+            color: #6b7280;
+            font-size: 14px;
+            font-style: italic;
+        }
+        
+        .message.chat {
+            background: white;
+            padding: 12px;
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        
+        .message.chat.own {
+            background: #e0e7ff;
+            margin-left: 40px;
+        }
+        
+        .message.chat .nickname {
+            font-weight: 600;
+            color: #667eea;
+            margin-bottom: 4px;
+            font-size: 14px;
+        }
+        
+        .message.chat.own .nickname {
+            color: #4338ca;
+        }
+        
+        .message.chat .text {
+            color: #333;
+        }
+        
+        .message.chat .time {
+            font-size: 11px;
+            color: #9ca3af;
+            margin-top: 4px;
+        }
+        
+        .input-area {
+            display: flex;
+            gap: 10px;
+        }
+        
+        .input-area input {
+            flex: 1;
+            max-width: none;
+        }
+        
+        .input-area button {
+            margin-top: 0;
+            padding: 12px 20px;
+        }
+        
+        .hidden {
+            display: none !important;
+        }
+        
+        .info {
+            background: #dbeafe;
+            color: #1e40af;
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 13px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>💬 Chat Global</h1>
+            <div class="status" id="status">🔴 Desconectado</div>
+        </div>
+        
+        <!-- Tela de Autenticação -->
+        <div class="auth-screen" id="authScreen">
+            <h2>Bem-vindo!</h2>
+            <p>Digite seu nickname para entrar no chat</p>
+            <div class="user-id" id="userIdDisplay" style="display: none;">
+                🆔 Seu ID: <span id="userId"></span>
+            </div>
+            <input 
+                type="text" 
+                id="nicknameInput" 
+                placeholder="Seu nickname (2-20 caracteres)"
+                maxlength="20"
+            >
+            <button onclick="setNickname()">Entrar no Chat</button>
+            <div class="error" id="authError"></div>
+        </div>
+        
+        <!-- Tela de Chat -->
+        <div class="chat-screen hidden" id="chatScreen">
+            <div class="info">
+                <span id="welcomeMessage"></span> • 
+                <span id="onlineCount">0 usuários online</span>
+            </div>
+            <div class="messages" id="messages"></div>
+            <div class="input-area">
+                <input 
+                    type="text" 
+                    id="messageInput" 
+                    placeholder="Digite sua mensagem..."
+                    onkeypress="handleKeyPress(event)"
+                >
+                <button onclick="sendMessage()">Enviar</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // CONFIGURAÇÃO
+        const WS_URL = 'ws://localhost:3000'; // Alterar para produção
+        
+        // Estado da aplicação
+        let ws = null;
+        let authenticated = false;
+        let userId = localStorage.getItem('chat-userId') || crypto.randomUUID();
+        let connectionId = null;
+        let myNickname = null;
+        
+        // Salva userId no localStorage
+        localStorage.setItem('chat-userId', userId);
+        
+        // Elementos DOM
+        const authScreen = document.getElementById('authScreen');
+        const chatScreen = document.getElementById('chatScreen');
+        const status = document.getElementById('status');
+        const nicknameInput = document.getElementById('nicknameInput');
+        const messageInput = document.getElementById('messageInput');
+        const messages = document.getElementById('messages');
+        const authError = document.getElementById('authError');
+        const userIdDisplay = document.getElementById('userIdDisplay');
+        const userIdSpan = document.getElementById('userId');
+        const welcomeMessage = document.getElementById('welcomeMessage');
+        const onlineCount = document.getElementById('onlineCount');
+        
+        // Conecta ao WebSocket
+        function connect() {
+            ws = new WebSocket(WS_URL);
+            
+            ws.onopen = () => {
+                console.log('Conectado ao servidor');
+                status.textContent = '🟡 Aguardando autenticação...';
+                status.className = 'status';
+            };
+            
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                handleMessage(data);
+            };
+            
+            ws.onerror = (error) => {
+                console.error('Erro WebSocket:', error);
+                status.textContent = '🔴 Erro de conexão';
+                status.className = 'status disconnected';
+            };
+            
+            ws.onclose = () => {
+                console.log('Desconectado do servidor');
+                status.textContent = '🔴 Desconectado';
+                status.className = 'status disconnected';
+                authenticated = false;
+            };
+        }
+        
+        // Processa mensagens do servidor
+        function handleMessage(data) {
+            switch (data.type) {
+                case 'request-auth':
+                    connectionId = data.connectionId;
+                    userIdSpan.textContent = `${userId.substring(0, 8)}... (ConnectionId: ${connectionId.substring(0, 8)}...)`;
+                    userIdDisplay.style.display = 'block';
+                    break;
+                    
+                case 'session-replaced':
+                    addSystemMessage(`⚠️ ${data.message}`);
+                    addSystemMessage(`💡 Você conectou em outro lugar`);
+                    addSystemMessage(`🔴 Esta conexão será encerrada`);
+                    authenticated = false;
+                    
+                    // Mostra tela de autenticação novamente após 2s
+                    setTimeout(() => {
+                        authScreen.style.display = 'flex';
+                        chatScreen.style.display = 'none';
+                        if (ws) ws.close();
+                    }, 2000);
+                    break;
+                    
+                case 'auth-accepted':
+                    authenticated = true;
+                    myNickname = data.nickname;
+                    welcomeMessage.textContent = `Olá, ${myNickname}!`;
+                    updateOnlineCount(data.uniqueUsers);
+                    
+                    // Muda para tela de chat
+                    authScreen.classList.add('hidden');
+                    chatScreen.classList.remove('hidden');
+                    
+                    status.textContent = '🟢 Conectado';
+                    status.className = 'status connected';
+                    
+                    messageInput.focus();
+                    break;
+                    
+                case 'chat-message':
+                    addChatMessage(data);
+                    updateOnlineCount(data.uniqueUsers);
+                    break;
+                    
+                case 'user-joined':
+                    addSystemMessage(`🟢 ${data.message}`);
+                    updateOnlineCount(data.uniqueUsers);
+                    break;
+                    
+                case 'user-left':
+                    addSystemMessage(`🔴 ${data.message}`);
+                    updateOnlineCount(data.uniqueUsers);
+                    break;
+                    
+                case 'error':
+                    if (!authenticated) {
+                        // Mostra erro na tela de autenticação
+                        if (data.code) {
+                            authError.textContent = `[${data.code}] ${data.message}`;
+                        } else {
+                            authError.textContent = data.message;
+                        }
+                    } else {
+                        let errorMsg = `❌ Erro: ${data.message}`;
+                        
+                        if (data.code === 'MESSAGE_TOO_LARGE') {
+                            errorMsg += ` (${data.receivedSize}/${data.maxSize} bytes)`;
+                        }
+                        
+                        addSystemMessage(errorMsg);
+                    }
+                    break;
+            }
+        }
+        
+        // Define nickname
+        function setNickname() {
+            const nickname = nicknameInput.value.trim();
+            
+            if (!nickname) {
+                authError.textContent = 'Por favor, digite um nickname';
+                return;
+            }
+            
+            if (nickname.length < 2 || nickname.length > 20) {
+                authError.textContent = 'Nickname deve ter entre 2 e 20 caracteres';
+                return;
+            }
+            
+            authError.textContent = '';
+            
+            ws.send(JSON.stringify({
+                type: 'auth',
+                userId: userId,
+                nickname: nickname
+            }));
+        }
+        
+        function sendMessage() {
+            const text = messageInput.value.trim();
+            
+            if (!text) return;
+            
+            ws.send(JSON.stringify({
+                type: 'message',
+                text: text
+            }));
+            
+            messageInput.value = '';
+        }
+        
+        // Handle Enter key
+        function handleKeyPress(event) {
+            if (event.key === 'Enter') {
+                sendMessage();
+            }
+        }
+        
+        // Adiciona mensagem de chat
+        function addChatMessage(data) {
+            const div = document.createElement('div');
+            div.className = 'message chat';
+            
+            const isMyMessage = data.userId === userId;
+            if (isMyMessage) {
+                div.classList.add('own');
+            }
+            
+            const time = new Date(data.timestamp).toLocaleTimeString('pt-BR', {
+                hour: '2-digit',
+                minute: '2-digit'
+            });
+            
+            div.innerHTML = `
+                <div class="nickname">${data.nickname}${isMyMessage ? ' (você)' : ''}</div>
+                <div class="text">${escapeHtml(data.text)}</div>
+                <div class="time">${time}</div>
+            `;
+            
+            messages.appendChild(div);
+            messages.scrollTop = messages.scrollHeight;
+        }
+        
+        // Adiciona mensagem do sistema
+        function addSystemMessage(text) {
+            const div = document.createElement('div');
+            div.className = 'message system';
+            div.textContent = text;
+            
+            messages.appendChild(div);
+            messages.scrollTop = messages.scrollHeight;
+        }
+        
+        // Atualiza contador de usuários online
+        function updateOnlineCount(count) {
+            onlineCount.textContent = `${count} usuário${count !== 1 ? 's' : ''} online`;
+        }
+        
+        // Escapa HTML para prevenir XSS
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
+        // Permite Enter no input de nickname
+        nicknameInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                setNickname();
+            }
+        });
+        
+        // Conecta ao carregar a página
+        window.onload = () => {
+            connect();
+        };
+    </script>
+</body>
+</html>
+

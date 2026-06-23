@@ -1,0 +1,24 @@
+{
+	"name": "ws-cloudflare",
+	"version": "1.0.0",
+	"description": "WebSocket server usando Cloudflare Workers e cliente Node.js",
+	"type": "module",
+	"scripts": {
+		"dev": "wrangler dev",
+		"deploy": "wrangler deploy",
+		"client": "node client.js",
+		"client:local": "node client.js --local"
+	},
+	"keywords": ["websocket", "cloudflare", "workers"],
+	"author": "",
+	"license": "MIT",
+	"engines": {
+		"node": ">=22.0.0"
+	},
+	"devDependencies": {
+		"wrangler": "^4.51.0"
+	},
+	"dependencies": {
+		"ws": "^8.18.3"
+	}
+}

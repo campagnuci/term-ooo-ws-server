@@ -1,0 +1,28 @@
+name = "ws-cloudflare"
+main = "worker.js"
+compatibility_date = "2024-11-30"
+
+[dev]
+port = 3000
+
+[observability]
+enabled = true
+
+# Configuração do Durable Object para WebSocket com Hibernação
+[[durable_objects.bindings]]
+name = "WEBSOCKET_HIBERNATION_SERVER"
+class_name = "WebSocketHibernationServer"
+
+# Durable Object de salas multiplayer (uma instância por código de sala)
+[[durable_objects.bindings]]
+name = "GAME_ROOM"
+class_name = "GameRoom"
+
+# Migrations (incrementais — nunca edite tags antigas)
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WebSocketHibernationServer"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["GameRoom"]

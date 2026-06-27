@@ -6,7 +6,7 @@ Expõe **dois** Durable Objects, roteados por caminho no `worker.js`:
 
 | Caminho | Durable Object | Arquivo | Uso |
 |---------|----------------|---------|-----|
-| `/room/<CODE>` | `GameRoom` | `game-room.js` | 🎮 **Salas multiplayer** do jogo (Cooperativo + Competição) — uma instância por código de sala |
+| `/room/<CODE>` | `GameRoom` | `game-room.js` | 🎮 **Salas multiplayer** do jogo (Cooperativo, Competição e Time Trial — partidas multi-rodada) — uma instância por código de sala |
 | qualquer outro | `WebSocketHibernationServer` | `websocket-server.js` | 💬 Chat global único (legado) |
 
 > O frontend (`term-ooo`) conecta em `wss://<worker>.<subdomain>.workers.dev/room/<CODE>`.
@@ -16,8 +16,9 @@ Expõe **dois** Durable Objects, roteados por caminho no `worker.js`:
 
 - 🎮 **Salas multiplayer** - Uma instância de `GameRoom` por código de sala (`room:<CODE>`)
 - 🤝 **Modo Cooperativo** - O anfitrião joga e transmite o tabuleiro; os demais assistem e usam o chat
-- 🏆 **Modo Competição** - Todos jogam a mesma palavra; ranking ao vivo (🥇🥈🥉) e fim de partida automático
-- ⏱️ **Modo Time Trial** - Competição contra o relógio: tempo fixo escolhido pelo host, pontuação por rapidez/tentativas e término autoritativo via `alarm`
+- 🏆 **Modo Competição** - Corrida de tempo **multi-rodada**: soma o tempo de cada rodada; **menor total vence**; ranking acumulado ao vivo (🥇🥈🥉)
+- ⏱️ **Modo Time Trial** - Contra o relógio, **multi-rodada**: tempo fixo do host, **pontos acumulados** e término de rodada autoritativo via `alarm`
+- 🚦 **Partidas multi-rodada + largada sincronizada** - N rodadas (1–20) com placar acumulado; cada rodada inicia com contagem regressiva 5→1 (`roundStartedAt` ancorado no futuro) e **avanço automático** entre rodadas
 - 👑 **Migração de host** - Se o anfitrião sai, o membro mais antigo é promovido
 - 🔒 **Conexão Única** - 1 userId = 1 conexão ativa (sessão antiga é substituída)
 - 📡 **Broadcast** - Entrada/saída, estado do jogo, rodadas e ranking
@@ -74,27 +75,50 @@ pnpm client:local    # local
 - O **servidor** é autoridade sobre: membros, host, `mode`, `seed`, `roundId` e o tipo de sala (`gameType`).
 - O servidor **nunca conhece a palavra** — apenas `(mode, seed)`. Os clientes derivam a palavra do dicionário embutido via `getDailyWords`.
 - **Cooperativo:** só o host roda o engine e transmite o `GameState`; o servidor **retransmite e persiste** (para late joiners / reconexão). A palavra é revelada a todos no fim da rodada.
-- **Competição:** cada cliente roda o próprio engine e **reporta quando termina**; o servidor controla o ranking e decide o fim da partida.
-- **Time Trial:** como a competição, mas o servidor guarda o **limite de tempo** (`timeLimitMs`), **pontua** cada acerto (`computePoints`) e arma um **`alarm`** que encerra a partida no fim do relógio (ver [Modo Time Trial](#modo-time-trial-contra-o-relógio)).
-- **Cronômetro:** o servidor é autoridade do tempo da rodada (`roundStartedAt`/`roundEndedAt`) e anexa um bloco `timer` às mensagens; cada cliente ancora no próprio relógio e conta localmente (ver [Cronômetro sincronizado da rodada](#cronômetro-sincronizado-da-rodada)).
+- **Competição:** cada cliente roda o próprio engine e **reporta quando termina**; o servidor controla o ranking e decide o fim de cada rodada.
+- **Time Trial:** como a competição, mas o servidor guarda o **limite de tempo** (`timeLimitMs`), **pontua** cada acerto (`computePoints`) e arma um **`alarm`** que encerra a **rodada** no fim do relógio (ver [Modo Time Trial](#modo-time-trial-contra-o-relógio)).
+- **Multi-rodada:** competição e Time Trial são partidas de **N rodadas** com placar **acumulado** (`room.competition.cumulative`); o servidor pontua cada rodada (`scoreRound`) e **avança automaticamente** (ver [Ciclo da partida](#ciclo-da-partida-multi-rodada) e [Pontuação acumulada](#pontuação-acumulada-scoreround)).
+- **Cronômetro / largada:** o servidor é autoridade do tempo da rodada (`roundStartedAt`/`roundEndedAt`) e ancora a largada **no futuro** para a contagem regressiva (ver [Largada e contagem regressiva](#largada-e-contagem-regressiva)); cada cliente ancora no próprio relógio e conta localmente (ver [Cronômetro sincronizado da rodada](#cronômetro-sincronizado-da-rodada)).
 
-### Ciclo da competição
+### Ciclo da partida (multi-rodada)
 
-1. **Início** (`start-match`, só host): exige **≥ 2 jogadores**; gera novo `seed` + `roundId`, zera o ranking e transmite `match-start`. Antes disso, ninguém pode jogar.
-2. **Durante:** cada jogador resolve seu tabuleiro; ao terminar (acertar **ou** esgotar tentativas) envia `competitor-finished`.
-3. **Ranking:** apenas quem **acerta** recebe posição (1º/2º/3º…); quem falha não é ranqueado. Cada finalista recebe `solveMs` (tempo desde a largada), exibido no ranking e no pódio.
-4. **Fim da partida** (`match-end`): termina quando **todos terminam**, **ou** quando o pódio (1º/2º/3º) está completo e resta apenas **1** jogador. Enquanto houver vaga no pódio, os demais continuam jogando. A saída de um jogador também reavalia essa condição.
+Uma partida competitiva tem **N rodadas** (`room.competition.totalRounds`, 1–20). A pontuação **acumula** em `room.competition.cumulative` e o conjunto de competidores é **fixado na largada** (`room.competition.competitors`).
+
+1. **Início** (`start-match`, só host): exige **≥ 2 jogadores**; lê `rounds` (clamp 1–20, padrão 5), fixa os **competidores** (quem está na sala agora), gera `seed` + `roundId`, zera o placar e transmite `match-start`. A rodada 1 começa **após a contagem** (ver [Largada e contagem regressiva](#largada-e-contagem-regressiva)).
+2. **Durante a rodada:** cada competidor resolve seu tabuleiro; ao terminar (acertar **ou** esgotar tentativas) envia `competitor-finished`. `room.competition.finishers` é o estado da **rodada corrente** (zerado a cada rodada).
+3. **Fim da rodada** (`isRoundOver`): quando **todos os competidores ativos terminam**, **ou** (Competição) quando o pódio (1º/2º/3º) está completo e resta apenas **1** jogador. No Time Trial, o `alarm` do tempo também encerra a rodada.
+4. **Pontuação** (`scoreRound`) é somada ao acumulado; então `endCurrentRound`:
+   - se **restam rodadas** → prepara a próxima (novo `seed`/`roundId`, `finishers` zerado, nova largada futura) e transmite **`round-advanced`** com o ranking acumulado;
+   - se foi a **última** → `status: "ended"` e transmite `match-end`.
 
 ```js
-// Condição de término (game-room.js)
-matchEnds = stillTrying === 0 || (stillTrying === 1 && solvedCount >= PODIUM_SIZE /* 3 */)
+// Fim da RODADA (game-room.js)
+roundEnds =
+  stillTrying === 0 ||
+  (gameType === "competition" && stillTrying === 1 && solvedCount >= PODIUM_SIZE /* 3 */)
+// stillTrying = competidores ATIVOS (ainda na sala) que não terminaram a rodada
 ```
+
+### Pontuação acumulada (`scoreRound`)
+
+- **Time Trial:** soma os **pontos** de cada rodada (DNF = 0) em `totalPoints`; **maior total vence** (desempate pelo menor `totalMs`).
+- **Competição (corrida de tempo):** soma o **tempo de resolução** em `totalMs`; **menor total vence**. Quem **não resolve** a rodada recebe `(maior tempo entre os solvers da rodada) + 60000ms`; se **ninguém** resolve, a rodada é **anulada** (todos +0).
+- Só **competidores ativos** (ainda na sala) pontuam a cada rodada: quem entrou **depois** da largada apenas assiste; quem **sai** tem o placar **congelado**.
+
+### Largada e contagem regressiva
+
+Cada rodada (inclusive a 1ª) começa com uma **contagem regressiva de 5s** vista por todos. Para isso o servidor ancora o início **no futuro**:
+
+- `roundStartedAt = Date.now() + COUNTDOWN_MS` (5s). As mensagens carregam `startsAt` (= `roundStartedAt`); o cliente roda a animação 5→1 "Vai!" até lá.
+- O **relógio do Time Trial** e a medição de `solveMs` só contam **após** `roundStartedAt`; o `alarm` é agendado para `roundStartedAt + timeLimitMs`.
+- `competitor-finished` recebido **antes** de `roundStartedAt` é **rejeitado** (não pontua/mede durante a contagem).
+- As rodadas **avançam automaticamente** — ao encerrar uma, o servidor já prepara a próxima, sem ação do host.
 
 ### Cronômetro sincronizado da rodada
 
 O servidor é a **autoridade do tempo**, garantindo que todos os jogadores vejam **o mesmo cronômetro** com latência mínima:
 
-- **Competição:** o relógio começa no `start-match` (largada igual para todos) e congela no `match-end`.
+- **Competição / Time Trial:** o relógio de cada rodada começa **após a contagem** (`roundStartedAt`, igual para todos) e congela no fim da rodada.
 - **Cooperativo:** começa na **1ª ação do host** (primeira `live-input`/`game-state`) — propagada a todos via `round-timing` — e congela quando o host conclui (`isGameOver`).
 - O servidor guarda `roundStartedAt`/`roundEndedAt` (epoch ms) no storage e anexa um bloco `timer` às mensagens de rodada:
 
@@ -116,7 +140,7 @@ timer = {
 Variante competitiva com **tempo fixo**. Reusa o estado de competição (`room.competition`), com três adições no servidor:
 
 1. **Limite de tempo:** no `start-match`, o host envia `timeLimitMs`; o servidor faz *clamp* em **30s–15min** (padrão 2min) e o guarda em `room.timeLimitMs`. O bloco `timer` passa a expor `limitMs` (o cliente mostra **contagem regressiva**).
-2. **Término autoritativo (`alarm`):** o servidor agenda `ctx.storage.setAlarm(roundStartedAt + timeLimitMs)`. Quando dispara, `alarm()` marca quem não terminou como **DNF (0 pontos)**, congela o ranking e transmite `match-end` com `reason: "timeout"`. O `alarm` é cancelado (`deleteAlarm`) se a partida terminar antes (todos concluíram) ou se a sala fechar.
+2. **Término de rodada autoritativo (`alarm`):** o servidor agenda `ctx.storage.setAlarm(roundStartedAt + timeLimitMs)`. Quando dispara, `alarm()` marca quem não terminou como **DNF (0 pontos)**, pontua a rodada e **avança** (`round-advanced`) — ou encerra a partida (`match-end`) se foi a última. O `alarm` é o **único** uso do alarm do DO (re-armado a cada rodada) e é cancelado (`deleteAlarm`) se a rodada terminar antes (todos concluíram) ou se a sala fechar.
 3. **Pontuação (só quem resolve pontua):**
 
 ```js
@@ -126,9 +150,9 @@ points = 1000                                   // base por resolver
 // attemptsLeft = maxAttempts(modo) - tentativas usadas ; não-solvers = 0
 ```
 
-A partida termina quando **todos terminam** (sem encerramento por pódio, ao contrário da Competição) **ou** quando o `alarm` dispara. O ranking/pódio é por **pontos** (desempate pelo menor tempo); `solveRank` fica `null` (a ordenação por pontos é feita no cliente). Cada finalista carrega `points` e `solveMs`.
+Cada **rodada** termina quando **todos terminam** (sem encerramento por pódio, ao contrário da Competição) **ou** quando o `alarm` dispara; os **pontos somam** entre as rodadas. O ranking é por **pontos acumulados** (desempate pelo menor tempo total); `solveRank` fica `null` (a ordenação é feita no cliente). Cada finalista da rodada carrega `points` e `solveMs`.
 
-> Os modos Cooperativo e Competição **não** são afetados: o Time Trial só adiciona ramos guardados por `gameType === "timetrial"` (e o helper `isCompetitive`).
+> O modo **Cooperativo não** é afetado. A lógica competitiva (Competição **e** Time Trial) compartilha a máquina de rodadas, guardada por `isCompetitive`/`gameType`; o Time Trial adiciona o limite de tempo, a pontuação e o `alarm`.
 
 ## 📡 Protocolo de Mensagens
 
@@ -141,25 +165,26 @@ A partida termina quando **todos terminam** (sem encerramento por pódio, ao con
 | `game-state` | host (coop) | Snapshot do tabuleiro do host |
 | `live-input` | host (coop) | Digitação ao vivo (efêmero, não persiste) |
 | `new-round` | host (coop) | Nova palavra |
-| `start-match` | host (competição/Time Trial) | Inicia a partida (≥ 2 jogadores; `timeLimitMs` no Time Trial) |
-| `competitor-finished` | todos (competição/Time Trial) | Reporta fim (`solved`, `attempts`, `roundId`) |
+| `start-match` | host (competição/Time Trial) | Inicia a partida (≥ 2 jogadores; `rounds` 1–20; `timeLimitMs` no Time Trial) |
+| `competitor-finished` | todos (competição/Time Trial) | Reporta fim da rodada (`solved`, `attempts`, `roundId`) |
 | `get-room-state` | todos | Solicita snapshot da sala |
 | `ping` | todos | Mede latência |
 
 ### Servidor → Cliente
 
-> As mensagens de rodada (`room-state`, `game-state`, `new-round`, `match-start`, `competitor-finished`, `match-end`, `round-timing`) carregam o bloco **`timer`** do cronômetro (ver [Cronômetro sincronizado da rodada](#cronômetro-sincronizado-da-rodada)).
+> As mensagens de rodada (`room-state`, `game-state`, `new-round`, `match-start`, `round-advanced`, `competitor-finished`, `match-end`, `round-timing`) carregam o bloco **`timer`** do cronômetro (ver [Cronômetro sincronizado da rodada](#cronômetro-sincronizado-da-rodada)). As competitivas também trazem `round`/`totalRounds`/`startsAt`/`competitorIds`.
 
 | Tipo | Descrição |
 |------|-----------|
 | `request-auth` | Pede autenticação ao conectar |
-| `room-state` | Snapshot da sala (inclui `gameType`, `matchStatus`, `standings`, `timer`) |
+| `room-state` | Snapshot da sala (inclui `gameType`, `matchStatus`, `standings` acumuladas, `roundFinishers`, `round`/`totalRounds`, `startsAt`, `competitorIds`, `timer`) |
 | `game-state` | Tabuleiro do host (coop) — relay/replay (+ `timer`) |
 | `live-input` | Digitação ao vivo do host (coop) |
 | `new-round` | Nova rodada iniciada (coop) (+ `timer`) |
-| `match-start` | Partida (Competição/Time Trial) iniciada (`mode`, `seed`, `roundId`, `timer` — com `limitMs` no Time Trial) |
-| `competitor-finished` | Atualização do ranking (`standings`, com `solveMs` e, no Time Trial, `points`) (+ `timer`) |
-| `match-end` | Partida encerrada — clientes revelam a palavra (+ `timer`; `reason: "timeout"` quando o tempo do Time Trial esgota) |
+| `match-start` | Partida (Competição/Time Trial) iniciada (`mode`, `seed`, `roundId`, `round`, `totalRounds`, `startsAt`, `competitorIds`, `timer` — `limitMs` no Time Trial) |
+| `round-advanced` | 🆕 Rodada encerrada e próxima preparada (novo `seed`/`roundId`, `round`, `startsAt`, `standings` acumuladas, `roundFinishers`) (+ `timer`) |
+| `competitor-finished` | Progresso da rodada (`roundFinishers` = quem terminou a rodada; `standings` = ranking acumulado; `solveMs` e, no Time Trial, `points`) (+ `timer`) |
+| `match-end` | Partida encerrada — clientes revelam a palavra; `standings` = classificação **final acumulada** (+ `timer`; `reason: "timeout"` quando o tempo do Time Trial esgota) |
 | `round-timing` | Sincroniza o cronômetro (início/fim) — usado no coop (1ª ação do host, fim da rodada) e após troca de host |
 | `chat-message` | Mensagem de chat |
 | `user-joined` / `user-left` | Entrada/saída de membros |
@@ -188,6 +213,7 @@ A partida termina quando **todos terminam** (sem encerramento por pódio, ao con
 - `ctx.acceptWebSocket()` habilita a Hibernação (conexões persistem inativas)
 - `serializeAttachment()` mantém os dados de cada conexão durante a hibernação
 - Estado canônico (`room`, `gameState`) em `ctx.storage` — sobrevive a reinícios do DO. O `room` inclui o cronômetro da rodada (`roundStartedAt`/`roundEndedAt`) e, no Time Trial, o limite (`timeLimitMs`), então *late joiners* e reconexões recuperam o tempo correto
+- `room.competition` guarda o estado multi-rodada — `currentRound`/`totalRounds`, o placar acumulado (`cumulative`), os finalistas da rodada (`finishers`) e o conjunto fixo de `competitors` — sobrevivendo à hibernação entre rodadas
 - Ao mudar o cronômetro, `room` e `gameState` são gravados **atomicamente** (`ctx.storage.put({ room, gameState })`), evitando estado inconsistente caso o DO hiberne/seja despejado entre escritas
 - **Time Trial:** `ctx.storage.setAlarm()` agenda o término no fim do tempo; o `alarm()` é entregue mesmo após hibernação (cancelado via `deleteAlarm()` se a partida terminar antes)
 - Sockets de um usuário são encontrados iterando `ctx.getWebSockets()`

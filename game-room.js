@@ -34,6 +34,19 @@ export class GameRoom extends DurableObject {
     this.TIMETRIAL_MAX_MS = 15 * 60_000; // 15min
     this.TIMETRIAL_DEFAULT_MS = 120_000; // 2min
 
+    // Partidas com múltiplas rodadas (competição e Time Trial). A pontuação
+    // acumula a cada rodada; ao fim de todas, o ranking final é congelado.
+    this.DEFAULT_ROUNDS = 5;
+    this.MAX_ROUNDS = 20;
+    // Contagem regressiva antes de CADA rodada (início e entre rodadas). O
+    // relógio/pontos só começam ao fim dela: `roundStartedAt` é ancorado no
+    // futuro (now + COUNTDOWN_MS), então o Time Trial não consome tempo durante
+    // a animação e ninguém é pego de surpresa.
+    this.COUNTDOWN_MS = 5_000;
+    // Penalidade de quem não resolve uma rodada de Competição: tempo do solver
+    // mais lento da rodada + este valor.
+    this.COMPETITION_DNF_PENALTY_MS = 60_000;
+
     // Anti-spam (apenas para mensagens de chat; tentativas não são limitadas).
     this.SPAM_CONFIG = {
       WINDOW_MS: 10_000,
@@ -141,6 +154,7 @@ export class GameRoom extends DurableObject {
   }
 
   roomStatePayload(room, userId) {
+    const comp = room.competition;
     return {
       type: "room-state",
       code: room.code,
@@ -152,8 +166,19 @@ export class GameRoom extends DurableObject {
       members: room.members.map((m) => ({ userId: m.userId, nickname: m.nickname })),
       memberCount: this.memberCount(room),
       gameType: room.gameType || "coop",
-      matchStatus: room.competition ? room.competition.status : "idle",
-      standings: room.competition ? room.competition.finishers : [],
+      matchStatus: comp ? comp.status : "idle",
+      // standings = ranking ACUMULADO (rodadas concluídas). roundFinishers = quem
+      // já terminou a rodada CORRENTE (status ⏳/✅/💀 ao vivo).
+      standings: comp ? comp.cumulative || [] : [],
+      roundFinishers: comp ? comp.finishers || [] : [],
+      round: comp ? comp.currentRound || 0 : 0,
+      totalRounds: comp ? comp.totalRounds || 0 : 0,
+      // Momento (epoch servidor) em que a rodada corrente começa de fato. Se está
+      // no futuro, os clientes mostram a contagem regressiva.
+      startsAt: comp && comp.status === "active" ? room.roundStartedAt : null,
+      competitorIds: comp && Array.isArray(comp.competitors)
+        ? comp.competitors.map((c) => c.userId)
+        : [],
       timer: this.roundTimer(room),
     };
   }
@@ -667,6 +692,17 @@ export class GameRoom extends DurableObject {
       return;
     }
 
+    // Em sala competitiva, 'new-round' (fluxo do coop) nunca deve abortar uma
+    // partida multi-rodada em andamento. O fluxo competitivo usa 'start-match'.
+    if (this.isCompetitive(room) && room.competition && room.competition.status === "active") {
+      this.send(ws, {
+        type: "error",
+        code: "MATCH_IN_PROGRESS",
+        message: "Uma partida já está em andamento.",
+      });
+      return;
+    }
+
     const modeChanged = this.VALID_MODES.has(data.mode) && data.mode !== room.mode;
     if (this.VALID_MODES.has(data.mode)) {
       room.mode = data.mode;
@@ -680,7 +716,14 @@ export class GameRoom extends DurableObject {
     // competitiva, zera o ranking/estado para não vazar uma partida encerrada
     // a quem reconectar antes do próximo start-match.
     if (this.isCompetitive(room) && room.competition) {
-      room.competition = { status: "idle", finishers: [] };
+      room.competition = {
+        status: "idle",
+        currentRound: 0,
+        totalRounds: 0,
+        finishers: [],
+        cumulative: [],
+        competitors: [],
+      };
       // Time Trial: cancela qualquer alarm pendente e limpa o limite (evita que
       // um timer obsoleto vaze para os clientes via room-state).
       if (room.gameType === "timetrial") {
@@ -721,16 +764,159 @@ export class GameRoom extends DurableObject {
   //
   // Time Trial: o tempo é tratado pelo `alarm()`; a partida só termina "cedo"
   // (antes do tempo) quando TODOS terminaram — não há encerramento por pódio.
-  isMatchOver(room) {
-    if (!room.competition) return false;
-    const finisherIds = new Set(room.competition.finishers.map((f) => f.userId));
-    const stillTrying = room.members.filter((m) => !finisherIds.has(m.userId)).length;
-    if (room.gameType === "timetrial") {
-      return stillTrying === 0;
-    }
-    const solvedCount = room.competition.finishers.filter((f) => f.solved).length;
+  // Competidores da partida que AINDA estão na sala. O conjunto de competidores
+  // é fixado no start-match (quem entra depois assiste e só joga na próxima
+  // partida); quem sai tem o placar congelado e deixa de pontuar.
+  activeCompetitors(room) {
+    const comp = room.competition;
+    if (!comp || !Array.isArray(comp.competitors)) return [];
+    const memberIds = new Set(room.members.map((m) => m.userId));
+    return comp.competitors.filter((c) => memberIds.has(c.userId));
+  }
+
+  // Fim da RODADA corrente (não da partida). Mesmas regras de antes, mas sobre os
+  // competidores ativos:
+  //  - Time Trial: termina quando todos terminaram (o `alarm()` trata o tempo).
+  //  - Competição: todos terminaram OU pódio cheio e resta só 1 tentando.
+  isRoundOver(room) {
+    const comp = room.competition;
+    if (!comp) return false;
+    const finisherIds = new Set(comp.finishers.map((f) => f.userId));
+    const stillTrying = this.activeCompetitors(room).filter(
+      (c) => !finisherIds.has(c.userId)
+    ).length;
+    if (room.gameType === "timetrial") return stillTrying === 0;
+    const solvedCount = comp.finishers.filter((f) => f.solved).length;
     const podiumFull = solvedCount >= this.PODIUM_SIZE;
     return stillTrying === 0 || (stillTrying === 1 && podiumFull);
+  }
+
+  // Acumula o resultado da rodada corrente no ranking da partida (comp.cumulative).
+  //  - Time Trial: soma os pontos da rodada (DNF = 0); maior total vence.
+  //  - Competição: soma o TEMPO da rodada; menor total vence. Quem não resolve
+  //    recebe (tempo do solver mais lento da rodada) + penalidade. Se NINGUÉM
+  //    resolve, a rodada é anulada (todos somam 0 → ranking inalterado).
+  scoreRound(room) {
+    const comp = room.competition;
+    const isTT = room.gameType === "timetrial";
+    const active = this.activeCompetitors(room);
+    const finById = new Map(comp.finishers.map((f) => [f.userId, f]));
+
+    let slowestSolverMs = null;
+    if (!isTT) {
+      // Baseline da penalidade = solver MAIS LENTO da rodada, considerando TODOS
+      // que resolveram (inclui quem resolveu e depois saiu — o tempo dele ainda
+      // serve de referência, senão a penalidade dos não-solvers ficaria menor).
+      for (const f of comp.finishers) {
+        if (f.solved && typeof f.solveMs === "number") {
+          slowestSolverMs =
+            slowestSolverMs == null ? f.solveMs : Math.max(slowestSolverMs, f.solveMs);
+        }
+      }
+    }
+    const voidRound = !isTT && slowestSolverMs == null; // ninguém resolveu
+
+    if (!Array.isArray(comp.cumulative)) comp.cumulative = [];
+    for (const c of active) {
+      const f = finById.get(c.userId);
+      const solved = !!(f && f.solved);
+
+      let entry = comp.cumulative.find((e) => e.userId === c.userId);
+      if (!entry) {
+        entry = {
+          userId: c.userId,
+          nickname: c.nickname,
+          totalMs: 0,
+          totalPoints: 0,
+          roundsSolved: 0,
+          roundsPlayed: 0,
+        };
+        comp.cumulative.push(entry);
+      }
+      entry.nickname = c.nickname;
+      entry.roundsPlayed += 1;
+      if (solved) entry.roundsSolved += 1;
+
+      if (isTT) {
+        const pts = f && typeof f.points === "number" ? f.points : 0;
+        entry.totalPoints += pts;
+        if (solved && typeof f.solveMs === "number") entry.totalMs += f.solveMs;
+      } else if (voidRound) {
+        // rodada anulada: ninguém soma tempo
+      } else if (solved && typeof f.solveMs === "number") {
+        entry.totalMs += f.solveMs;
+      } else {
+        entry.totalMs += slowestSolverMs + this.COMPETITION_DNF_PENALTY_MS;
+      }
+    }
+  }
+
+  // Encerra a rodada corrente: pontua, congela o relógio e ou avança para a
+  // próxima rodada (ancorando o início após o countdown) ou encerra a partida.
+  // Persiste o `room`. Retorna o que precisa ser transmitido.
+  async endCurrentRound(room) {
+    const comp = room.competition;
+    if (room.roundEndedAt == null) room.roundEndedAt = Date.now();
+
+    const finishedRound = comp.currentRound;
+    const finishedRoundFinishers = comp.finishers.slice();
+
+    this.scoreRound(room);
+
+    const hasMore =
+      comp.currentRound < comp.totalRounds && this.activeCompetitors(room).length > 0;
+
+    if (hasMore) {
+      comp.currentRound += 1;
+      comp.finishers = [];
+      room.seed = this.generateSeed();
+      room.roundId = crypto.randomUUID();
+      // A próxima rodada começa após o countdown; o relógio do TT é ancorado lá.
+      room.roundStartedAt = Date.now() + this.COUNTDOWN_MS;
+      room.roundEndedAt = null;
+      if (room.gameType === "timetrial" && typeof room.timeLimitMs === "number") {
+        await this.ctx.storage.setAlarm(room.roundStartedAt + room.timeLimitMs);
+      } else {
+        await this.ctx.storage.deleteAlarm();
+      }
+      await this.putRoom(room);
+      return { outcome: "advanced", finishedRound, finishedRoundFinishers };
+    }
+
+    comp.status = "ended";
+    if (room.gameType === "timetrial") await this.ctx.storage.deleteAlarm();
+    await this.putRoom(room);
+    return { outcome: "ended", finishedRound, finishedRoundFinishers };
+  }
+
+  // Transmite o resultado de uma rodada encerrada: `round-advanced` (próxima
+  // rodada) ou `match-end` (partida encerrada). Em ambos, `standings` é o ranking
+  // ACUMULADO já com a rodada recém-encerrada incluída.
+  broadcastRoundOutcome(room, res) {
+    const comp = room.competition;
+    const common = {
+      standings: comp.cumulative || [],
+      roundFinishers: res.finishedRoundFinishers,
+      finishedRound: res.finishedRound,
+      totalRounds: comp.totalRounds,
+      roundId: room.roundId,
+      timer: this.roundTimer(room),
+    };
+    if (res.outcome === "advanced") {
+      this.broadcast({
+        type: "round-advanced",
+        matchStatus: "active",
+        round: comp.currentRound,
+        mode: room.mode,
+        seed: room.seed,
+        hostUserId: room.hostUserId,
+        startsAt: room.roundStartedAt,
+        competitorIds: comp.competitors.map((c) => c.userId),
+        ...common,
+      });
+    } else {
+      this.broadcast({ type: "match-end", matchStatus: "ended", ...common });
+    }
   }
 
   async handleStartMatch(ws, userData, data) {
@@ -778,9 +964,25 @@ export class GameRoom extends DurableObject {
     if (this.VALID_MODES.has(data.mode)) room.mode = data.mode;
     room.seed = this.generateSeed();
     room.roundId = crypto.randomUUID();
-    room.competition = { status: "active", finishers: [] };
-    // A corrida começa agora, igual para todos.
-    room.roundStartedAt = Date.now();
+
+    // Número de rodadas da partida (clamp 1..MAX). Competidores fixados agora:
+    // quem entrar depois assiste e só joga na próxima partida.
+    const requestedRounds = Math.round(Number(data.rounds));
+    const totalRounds = Number.isFinite(requestedRounds)
+      ? Math.min(this.MAX_ROUNDS, Math.max(1, requestedRounds))
+      : this.DEFAULT_ROUNDS;
+    room.competition = {
+      status: "active",
+      currentRound: 1,
+      totalRounds,
+      finishers: [],
+      cumulative: [],
+      competitors: room.members.map((m) => ({ userId: m.userId, nickname: m.nickname })),
+    };
+
+    // A rodada 1 começa após o countdown (igual para todos). O relógio/pontos só
+    // contam a partir de `roundStartedAt` — o Time Trial não gasta tempo na contagem.
+    room.roundStartedAt = Date.now() + this.COUNTDOWN_MS;
     room.roundEndedAt = null;
 
     // Time Trial: define o limite de tempo (clamp).
@@ -808,6 +1010,12 @@ export class GameRoom extends DurableObject {
       roundId: room.roundId,
       hostUserId: room.hostUserId,
       matchStatus: "active",
+      round: 1,
+      totalRounds,
+      startsAt: room.roundStartedAt,
+      competitorIds: room.competition.competitors.map((c) => c.userId),
+      standings: [],
+      roundFinishers: [],
       timer: this.roundTimer(room),
     });
   }
@@ -818,6 +1026,15 @@ export class GameRoom extends DurableObject {
     if (!room || !this.isCompetitive(room) || !room.competition) return;
     if (room.competition.status !== "active") return;
     if (data.roundId !== room.roundId) return;
+
+    const userId = userData.userId;
+
+    // Só competidores fixados no start-match pontuam (quem entrou depois assiste).
+    if (!this.activeCompetitors(room).some((c) => c.userId === userId)) return;
+
+    // Antes do fim do countdown a rodada ainda não começou: ignora (evita
+    // pontuar/medir tempo negativo durante a contagem regressiva).
+    if (room.roundStartedAt != null && Date.now() < room.roundStartedAt) return;
 
     // Time Trial: o relógio do SERVIDOR é autoridade. Rejeita submissões que
     // chegam após o fim do tempo (o `alarm()` trata esse jogador como DNF) —
@@ -831,8 +1048,7 @@ export class GameRoom extends DurableObject {
       return;
     }
 
-    const userId = userData.userId;
-    // Idempotente: ignora se este jogador já terminou nesta partida.
+    // Idempotente: ignora se este jogador já terminou a rodada CORRENTE.
     if (room.competition.finishers.some((f) => f.userId === userId)) return;
 
     const solved = !!data.solved;
@@ -861,15 +1077,14 @@ export class GameRoom extends DurableObject {
     };
     room.competition.finishers.push(finisher);
 
-    const ended = this.isMatchOver(room);
-    if (ended) {
-      room.competition.status = "ended";
-      if (room.roundEndedAt == null) room.roundEndedAt = Date.now();
-      // Time Trial: todos terminaram antes do tempo → cancela o alarm de timeout.
-      if (room.gameType === "timetrial") await this.ctx.storage.deleteAlarm();
-    }
-    await this.putRoom(room);
+    const roundOver = this.isRoundOver(room);
+    // Se a rodada não acabou, persiste já o finisher. Se acabou, o
+    // endCurrentRound abaixo persiste (após pontuar) — evita escrita dupla.
+    if (!roundOver) await this.putRoom(room);
 
+    // Avisa todos que este jogador terminou a rodada corrente. `standings` é o
+    // ranking ACUMULADO das rodadas já concluídas (a atual entra só ao encerrar);
+    // `roundFinishers` mostra o progresso da rodada corrente (✅/💀).
     this.broadcast({
       type: "competitor-finished",
       userId,
@@ -879,19 +1094,17 @@ export class GameRoom extends DurableObject {
       solveRank,
       solveMs,
       points,
-      standings: room.competition.finishers,
+      standings: room.competition.cumulative || [],
+      roundFinishers: room.competition.finishers,
+      round: room.competition.currentRound,
+      totalRounds: room.competition.totalRounds,
       roundId: room.roundId,
       timer: this.roundTimer(room),
     });
 
-    if (ended) {
-      this.broadcast({
-        type: "match-end",
-        matchStatus: "ended",
-        standings: room.competition.finishers,
-        roundId: room.roundId,
-        timer: this.roundTimer(room),
-      });
+    if (roundOver) {
+      const res = await this.endCurrentRound(room);
+      this.broadcastRoundOutcome(room, res);
     }
   }
 
@@ -902,13 +1115,17 @@ export class GameRoom extends DurableObject {
     const room = await this.getRoom();
     if (!room || room.gameType !== "timetrial" || !room.competition) return;
     if (room.competition.status !== "active") return;
+    // Defensivo: o alarm é armado em (início + limite); se disparar antes do
+    // início real (durante o countdown), ignora.
+    if (room.roundStartedAt != null && Date.now() < room.roundStartedAt) return;
 
+    // Quem não terminou a rodada vira DNF (0 pontos) — só competidores ativos.
     const finisherIds = new Set(room.competition.finishers.map((f) => f.userId));
-    for (const m of room.members) {
-      if (finisherIds.has(m.userId)) continue;
+    for (const c of this.activeCompetitors(room)) {
+      if (finisherIds.has(c.userId)) continue;
       room.competition.finishers.push({
-        userId: m.userId,
-        nickname: m.nickname,
+        userId: c.userId,
+        nickname: c.nickname,
         solved: false,
         attempts: 0,
         solveRank: null,
@@ -919,24 +1136,18 @@ export class GameRoom extends DurableObject {
       });
     }
 
-    room.competition.status = "ended";
     // Congela exatamente no fim do tempo (durationMs == timeLimitMs → 0:00).
+    // Definido ANTES de endCurrentRound para preservar este instante exato.
     if (room.roundEndedAt == null) {
       room.roundEndedAt =
         room.roundStartedAt != null && room.timeLimitMs != null
           ? room.roundStartedAt + room.timeLimitMs
           : Date.now();
     }
-    await this.putRoom(room);
 
-    this.broadcast({
-      type: "match-end",
-      matchStatus: "ended",
-      standings: room.competition.finishers,
-      roundId: room.roundId,
-      reason: "timeout",
-      timer: this.roundTimer(room),
-    });
+    // Encerra a rodada: pontua e avança (próxima rodada) ou encerra a partida.
+    const res = await this.endCurrentRound(room);
+    this.broadcastRoundOutcome(room, res);
   }
 
   async handleGetRoomState(ws, userData) {
@@ -1023,22 +1234,6 @@ export class GameRoom extends DurableObject {
       room.hostUserId = newHost.userId;
     }
 
-    // Partida competitiva em andamento: a saída pode satisfazer a condição de
-    // término (menos jogadores -> todos os restantes já terminaram).
-    let competitionEnded = false;
-    if (
-      this.isCompetitive(room) &&
-      room.competition &&
-      room.competition.status === "active" &&
-      this.isMatchOver(room)
-    ) {
-      room.competition.status = "ended";
-      if (room.roundEndedAt == null) room.roundEndedAt = Date.now();
-      competitionEnded = true;
-      // Time Trial: encerrou antes do tempo → cancela o alarm de timeout.
-      if (room.gameType === "timetrial") await this.ctx.storage.deleteAlarm();
-    }
-
     await this.putRoom(room);
 
     // Notifica saída.
@@ -1070,15 +1265,26 @@ export class GameRoom extends DurableObject {
       }
     }
 
-    // Encerra a partida competitiva se a saída satisfez a condição de término.
-    if (competitionEnded) {
-      this.broadcast({
-        type: "match-end",
-        matchStatus: "ended",
-        standings: room.competition.finishers,
-        roundId: room.roundId,
-        timer: this.roundTimer(room),
-      });
+    // Partida competitiva em andamento: a saída pode esvaziar os competidores
+    // (encerra a partida) ou completar a rodada (os restantes já terminaram).
+    if (this.isCompetitive(room) && room.competition && room.competition.status === "active") {
+      if (this.activeCompetitors(room).length === 0) {
+        room.competition.status = "ended";
+        if (room.roundEndedAt == null) room.roundEndedAt = Date.now();
+        if (room.gameType === "timetrial") await this.ctx.storage.deleteAlarm();
+        await this.putRoom(room);
+        this.broadcast({
+          type: "match-end",
+          matchStatus: "ended",
+          standings: room.competition.cumulative || [],
+          totalRounds: room.competition.totalRounds,
+          roundId: room.roundId,
+          timer: this.roundTimer(room),
+        });
+      } else if (this.isRoundOver(room)) {
+        const res = await this.endCurrentRound(room);
+        this.broadcastRoundOutcome(room, res);
+      }
     }
   }
 

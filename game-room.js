@@ -47,6 +47,13 @@ export class GameRoom extends DurableObject {
     // mais lento da rodada + este valor.
     this.COMPETITION_DNF_PENALTY_MS = 60_000;
 
+    // Tolerância de reconexão: ao cair, o membro NÃO é removido na hora. Ele fica
+    // marcado como desconectado (`disconnectedAt`) e mantém o lugar/host/placar
+    // por esta janela. Reconexão dentro dela é transparente; passada a janela, um
+    // membro sem socket ativo é removido de fato (pruneDisconnected). ~20s cobre
+    // as primeiras tentativas de reconexão do cliente (1+2+4+8s) e o heartbeat (20s).
+    this.DISCONNECT_GRACE_MS = 20_000;
+
     // Anti-spam (apenas para mensagens de chat; tentativas não são limitadas).
     this.SPAM_CONFIG = {
       WINDOW_MS: 10_000,
@@ -341,6 +348,11 @@ export class GameRoom extends DurableObject {
 
       const userData = ws.deserializeAttachment();
 
+      // Remove membros cuja janela de reconexão expirou. Dirigido por mensagens
+      // (o heartbeat `ping` a cada 20s acorda o DO de forma confiável mesmo sob
+      // hibernação), então não dependemos de `alarm()` — que o Time Trial já usa.
+      await this.pruneDisconnected();
+
       let data;
       try {
         data = JSON.parse(message);
@@ -489,6 +501,15 @@ export class GameRoom extends DurableObject {
     }
 
     const isReconnect = !!existingMember;
+    // Reconexão dentro da janela de tolerância: o membro estava marcado como
+    // desconectado. Limpa a marca para que o pruneDisconnected não o remova e
+    // avisa os demais que ele voltou (em vez de um "entrou" enganoso).
+    const wasDisconnected =
+      isReconnect && typeof existingMember.disconnectedAt === "number";
+    if (wasDisconnected) {
+      delete existingMember.disconnectedAt;
+      await this.putRoom(room);
+    }
 
     // Autentica este socket.
     userData.userId = userId;
@@ -513,11 +534,23 @@ export class GameRoom extends DurableObject {
       });
     }
 
-    // Notifica os demais apenas em entrada nova (não em reconexão).
+    // Notifica os demais: entrada nova → "entrou"; volta de queda → "voltou".
+    // Reconexão sem queda registrada (ex.: troca de aba antes da janela) é silenciosa.
     if (!isReconnect) {
       this.broadcast(
         {
           type: "user-joined",
+          userId,
+          nickname,
+          members: room.members.map((m) => ({ userId: m.userId, nickname: m.nickname })),
+          memberCount: this.memberCount(room),
+        },
+        ws
+      );
+    } else if (wasDisconnected) {
+      this.broadcast(
+        {
+          type: "user-reconnected",
           userId,
           nickname,
           members: room.members.map((m) => ({ userId: m.userId, nickname: m.nickname })),
@@ -1189,10 +1222,13 @@ export class GameRoom extends DurableObject {
 
       if (userData && userData.authenticated && userData.userId) {
         // Se ainda existe outro socket para o mesmo usuário, esta foi uma
-        // conexão substituída/duplicada — não removemos o membro.
+        // conexão substituída/duplicada — não mexemos no membro.
         const others = this.socketsForUser(userData.userId, ws);
         if (others.length === 0) {
-          await this.handleMemberLeave(userData.userId);
+          // NÃO removemos na hora: marcamos como desconectado e damos uma janela
+          // de tolerância para reconexão (blip de rede / reload). A remoção de
+          // fato acontece em pruneDisconnected se ele não voltar a tempo.
+          await this.markDisconnected(userData.userId);
         }
       }
     } catch (error) {
@@ -1207,8 +1243,63 @@ export class GameRoom extends DurableObject {
     }
   }
 
+  // Marca um membro como desconectado (sem removê-lo). Mantém o lugar na sala, o
+  // papel de host e o estado de competidor/placar durante a janela de tolerância.
+  async markDisconnected(userId) {
+    const room = await this.getRoom();
+    if (!room || room.closed) return;
+
+    const member = room.members.find((m) => m.userId === userId);
+    if (!member) return;
+    // Já marcado (ex.: close duplicado) → nada a fazer.
+    if (typeof member.disconnectedAt === "number") return;
+
+    member.disconnectedAt = Date.now();
+    await this.putRoom(room);
+
+    this.broadcast({
+      type: "user-disconnected",
+      userId,
+      nickname: member.nickname,
+      members: room.members.map((m) => ({ userId: m.userId, nickname: m.nickname })),
+      memberCount: this.memberCount(room),
+    });
+  }
+
+  // Remove de fato os membros cuja janela de tolerância expirou e que não têm
+  // socket ativo. Cada remoção aciona as consequências completas (migração de
+  // host, fim de rodada/partida) via finalizeLeave. Dirigido por mensagens
+  // (sobretudo o heartbeat), então é resiliente à hibernação sem usar o alarm.
+  async pruneDisconnected() {
+    const room = await this.getRoom();
+    if (!room || room.closed) return;
+
+    const now = Date.now();
+    const expired = room.members.filter(
+      (m) =>
+        typeof m.disconnectedAt === "number" &&
+        now - m.disconnectedAt >= this.DISCONNECT_GRACE_MS &&
+        this.socketsForUser(m.userId).length === 0
+    );
+    if (expired.length === 0) return;
+
+    for (const m of expired) {
+      await this.finalizeLeave(room, m.userId);
+      if (room.closed) break;
+    }
+  }
+
+  // Carrega a sala e remove o membro de fato (saída genuína).
   async handleMemberLeave(userId) {
     const room = await this.getRoom();
+    if (!room || room.closed) return;
+    await this.finalizeLeave(room, userId);
+  }
+
+  // Remove `userId` de uma sala JÁ carregada (em memória) e aplica todas as
+  // consequências: encerra a sala se vazia, migra o host, transmite `user-left`
+  // e resolve a partida competitiva (fim de rodada/partida). Persiste o `room`.
+  async finalizeLeave(room, userId) {
     if (!room || room.closed) return;
 
     const member = room.members.find((m) => m.userId === userId);
